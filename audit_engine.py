@@ -4,9 +4,10 @@ import random
 import requests
 import pandas as pd
 import json
+from io import StringIO
 
-def fetch_from_mops(stock_id: str, year: int, season: int, market_type: str) -> pd.DataFrame:
-    """向 MOPS 發送請求並回傳原始 DataFrame"""
+def fetch_from_mops(stock_id: str, year: int, season: int, market_type: str, max_retries: int = 2) -> pd.DataFrame:
+    """向 MOPS 發送請求並回傳原始 DataFrame，內建逾時重試機制"""
     url = "https://mops.twse.com.tw/mops/web/ajax_t164sb05"
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
@@ -18,18 +19,32 @@ def fetch_from_mops(stock_id: str, year: int, season: int, market_type: str) -> 
         "off": "1",
         "queryName": "co_id",
         "inpuType": "co_id",
-        "TYPEK": market_type,  # 'sii' 或 'otc'
+        "TYPEK": market_type,
         "isnew": "false",
         "co_id": stock_id,
         "year": str(year),
         "season": str(season)
     }
 
-    response = requests.post(url, data=payload, headers=headers, timeout=20)
-    response.raise_for_status()
-    dfs = pd.read_html(response.text)
-    if len(dfs) >= 2:
-        return dfs[1]
+    for attempt in range(max_retries):
+        try:
+            # 放寬至 35 秒，防禦 MOPS 伺服器頻寬雍塞
+            response = requests.post(url, data=payload, headers=headers, timeout=35)
+            response.raise_for_status()
+            
+            # 使用 StringIO 包裝，完全解決 FutureWarning
+            dfs = pd.read_html(StringIO(response.text))
+            if len(dfs) >= 2:
+                return dfs[1]
+            return pd.DataFrame()
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError):
+            if attempt < max_retries - 1:
+                time.sleep(3)  # 連線失敗冷卻 3 秒後重試
+                continue
+            raise
+        except Exception:
+            raise
+
     return pd.DataFrame()
 
 def audit_mops_cash_flow(stock_id: str, year: int, season: int) -> dict:
@@ -37,13 +52,13 @@ def audit_mops_cash_flow(stock_id: str, year: int, season: int) -> dict:
     df = pd.DataFrame()
     detected_market = "sii"
 
-    # 第一階段：先以上市 (sii) 請求
+    # 第一階段：先嘗試上市 (sii)
     try:
         df = fetch_from_mops(stock_id, year, season, "sii")
     except Exception:
         df = pd.DataFrame()
 
-    # 第二階段：若無資料，自動切換至上櫃 (otc) 回退重試
+    # 第二階段：若無資料，切換至上櫃 (otc) 重試
     if df.empty or "營業活動之淨現金流入" not in df.to_string():
         try:
             df = fetch_from_mops(stock_id, year, season, "otc")
@@ -79,7 +94,7 @@ def audit_mops_cash_flow(stock_id: str, year: int, season: int) -> dict:
         return {"status": "error", "stock_id": stock_id, "message": f"解析異常: {str(e)}"}
 
 def main():
-    # 範例清單：奇鋐 (3017 - 上市), 雙鴻 (3324 - 上櫃)
+    # 測試標的：奇鋐 (3017 - 上市), 雙鴻 (3324 - 上櫃)
     target_stocks = ["3017", "3324"]
     audit_results = []
 
@@ -87,11 +102,9 @@ def main():
 
     for idx, stock in enumerate(target_stocks):
         print(f"正在稽核標的: {stock} ...")
-        # 以民國 113 年第 2 季為例 (可依據回測年份調整)
         report = audit_mops_cash_flow(stock, 113, 2)
         audit_results.append(report)
 
-        # 隨機延遲防禦：避免 MOPS 防火牆觸發 Rate Limiting 封鎖 IP
         if idx < len(target_stocks) - 1:
             delay = round(random.uniform(3.0, 5.0), 2)
             print(f"冷卻等待 {delay} 秒以避免 IP 阻斷...")
@@ -100,7 +113,7 @@ def main():
     print("=== 稽核最終報告 ===")
     print(json.dumps(audit_results, ensure_ascii=False, indent=2))
 
-    # 若 GitHub Secrets 有注入 N8N_WEBHOOK_URL，則拋出數據
+    # 若設定 Webhook，自動向外部推送審計報表
     webhook_url = os.getenv("N8N_WEBHOOK_URL")
     if webhook_url:
         try:
